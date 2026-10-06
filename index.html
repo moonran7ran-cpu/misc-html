@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#17131f">
+  <title>ZT758A · 染染的蓝牙桥</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", system-ui, sans-serif;
+      background: #0d0d12;
+      color: #f5f2fb;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      padding: max(24px, env(safe-area-inset-top)) 20px max(24px, env(safe-area-inset-bottom));
+      background: radial-gradient(circle at 50% -10%, #352a50 0, #17131f 34%, #0d0d12 72%);
+    }
+
+    .wrap { max-width: 560px; margin: 0 auto; }
+
+    .card {
+      background: rgba(31, 27, 40, .9);
+      border: 1px solid rgba(210, 194, 238, .16);
+      border-radius: 24px;
+      padding: 22px;
+      box-shadow: 0 20px 70px rgba(0, 0, 0, .35);
+      backdrop-filter: blur(18px);
+    }
+
+    h1 { font-size: 24px; margin: 0 0 8px; }
+    .sub { opacity: .72; line-height: 1.55; margin-bottom: 20px; }
+
+    .status {
+      padding: 14px 16px;
+      border-radius: 16px;
+      background: #141119;
+      margin: 14px 0;
+      line-height: 1.65;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .dot {
+      display: inline-block;
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: #777;
+      margin-right: 7px;
+    }
+
+    .dot.ok { background: #64d38a; }
+    .dot.warn { background: #ffca6a; }
+    .dot.bad { background: #ff6b78; }
+
+    button, input {
+      width: 100%;
+      border: 0;
+      border-radius: 16px;
+      padding: 15px 18px;
+      font-size: 17px;
+    }
+
+    button {
+      font-weight: 650;
+      margin-top: 10px;
+      background: #8d6bd1;
+      color: white;
+    }
+
+    button.secondary { background: #2a2435; }
+    button.stop { background: #703641; }
+    button:disabled { opacity: .42; }
+
+    .setup {
+      margin-top: 16px;
+      padding: 16px;
+      border: 1px solid rgba(210, 194, 238, .13);
+      border-radius: 18px;
+      background: rgba(20, 17, 25, .7);
+    }
+
+    .setup label { display: block; font-size: 14px; opacity: .72; margin-bottom: 8px; }
+    .setup input { color: #f5f2fb; background: #0d0d12; outline: 1px solid rgba(210, 194, 238, .16); }
+    .setup[hidden] { display: none; }
+
+    .small { font-size: 13px; opacity: .58; line-height: 1.55; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="card">
+      <h1>ZT758A · 手机蓝牙桥</h1>
+      <div class="sub">在 Bluefy 中打开。连接后，本页会把远端 MCP 指令写入 ZT758A 的 FFE1。</div>
+      <div id="status" class="status"><span class="dot warn"></span>正在检查配置…</div>
+
+      <div id="setup" class="setup" hidden>
+        <label for="bridgeKey">桥接密钥只保存在这台手机的浏览器里，不会提交到 GitHub。</label>
+        <input id="bridgeKey" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="输入 Bridge key">
+        <button id="saveKey" class="secondary">保存密钥</button>
+      </div>
+
+      <button id="connect">连接 ZT758A</button>
+      <button id="stop" class="stop" disabled>立即停止</button>
+      <button id="disconnect" class="secondary" disabled>断开</button>
+
+      <div class="small">安全策略：单次动作最长 15 秒；命令 20 秒过期；掉线、切后台或离开页面会停止并撤销控制权。iPhone 会暂停后台网页，请保持 Bluefy 在前台。</div>
+    </section>
+  </main>
+
+  <script>
+    const BACKEND = 'https://vjzqctkmereuzoujdxng.supabase.co/functions/v1/zt758a-bridge';
+    const STORAGE_KEY = 'zt758a_bridge_key_v1';
+    const SERVICE = '0000ffe0-0000-1000-8000-00805f9b34fb';
+    const WRITE = '0000ffe1-0000-1000-8000-00805f9b34fb';
+
+    const hashParams = new URLSearchParams(location.hash.slice(1));
+    const keyFromHash = hashParams.get('key') || '';
+    if (keyFromHash) {
+      localStorage.setItem(STORAGE_KEY, keyFromHash);
+      history.replaceState(null, '', location.pathname + location.search);
+    }
+
+    let bridgeKey = localStorage.getItem(STORAGE_KEY) || '';
+    let device = null;
+    let server = null;
+    let writer = null;
+    let pollTimer = null;
+    let heartbeatTimer = null;
+    let keepaliveTimer = null;
+    let autoStopTimer = null;
+    let current = null;
+    let busy = false;
+    let wakeLock = null;
+
+    const $ = (id) => document.getElementById(id);
+
+    function setStatus(text, kind = 'warn') {
+      $('status').innerHTML = '<span class="dot ' + kind + '"></span>' + text;
+    }
+
+    function setConfigured(configured) {
+      $('setup').hidden = configured;
+      $('connect').disabled = !configured;
+      if (!configured) setStatus('需要桥接密钥后才能连接', 'warn');
+    }
+
+    function frame(action, mode) {
+      const command = action === 'vibrate' ? 0x03 : action === 'suction' ? 0x09 : 0x14;
+      return new Uint8Array([0x55, command, 0, 0, mode, 0, 0]);
+    }
+
+    async function writeBytes(bytes) {
+      if (!writer) throw new Error('FFE1 未连接');
+      if (writer.writeValueWithoutResponse) await writer.writeValueWithoutResponse(bytes);
+      else await writer.writeValue(bytes);
+    }
+
+    async function stopHardware() {
+      clearInterval(keepaliveTimer);
+      clearTimeout(autoStopTimer);
+      keepaliveTimer = null;
+      autoStopTimer = null;
+      current = null;
+      if (!writer) return;
+
+      const stops = [
+        new Uint8Array([0x55, 0x14, 0, 0, 0, 0, 0]),
+        new Uint8Array([0x55, 0x09, 0, 0, 0, 0, 0]),
+        new Uint8Array([0x55, 0x03, 0, 0, 0, 0, 0]),
+        new Uint8Array([0x55, 0x04, 0, 0, 0, 0, 0xAA])
+      ];
+
+      for (const bytes of stops) {
+        try {
+          await writeBytes(bytes);
+          await new Promise((resolve) => setTimeout(resolve, 70));
+        } catch {}
+      }
+    }
+
+    async function bridgeFetch(path, options = {}) {
+      const url = BACKEND + path + '?key=' + encodeURIComponent(bridgeKey);
+      return fetch(url, options);
+    }
+
+    async function heartbeat(connected, armed, lastError = null) {
+      try {
+        await bridgeFetch('/api/heartbeat', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ connected, armed, current_action: current, last_error: lastError })
+        });
+      } catch {}
+    }
+
+    async function ack(id, ok, message) {
+      try {
+        await bridgeFetch('/api/ack', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ id, ok, message })
+        });
+      } catch {}
+    }
+
+    async function execute(command) {
+      busy = true;
+      try {
+        if (command.action === 'stop') {
+          await stopHardware();
+          await ack(command.id, true, 'all functions stopped');
+          setStatus('已停止 · 等待指令', 'ok');
+        } else {
+          await stopHardware();
+          const bytes = frame(command.action, Number(command.mode));
+          await writeBytes(bytes);
+          const seconds = Math.max(1, Math.min(15, Number(command.duration_seconds) || 5));
+          current = {
+            action: command.action,
+            mode: Number(command.mode),
+            until: new Date(Date.now() + seconds * 1000).toISOString()
+          };
+          keepaliveTimer = setInterval(() => {
+            if (writer && current) writeBytes(bytes).catch(() => {});
+          }, 1300);
+          autoStopTimer = setTimeout(async () => {
+            await stopHardware();
+            await heartbeat(true, true);
+            setStatus('自动停止 · 等待指令', 'ok');
+          }, seconds * 1000);
+          await ack(command.id, true, command.action + ' mode ' + command.mode + ' written by phone bridge');
+          setStatus('执行中：' + command.action + ' ' + command.mode + '档', 'ok');
+        }
+      } catch (error) {
+        const message = String(error?.message || error);
+        await ack(command.id, false, message);
+        setStatus('执行失败：' + message, 'bad');
+      } finally {
+        busy = false;
+        await heartbeat(Boolean(writer), Boolean(writer));
+      }
+    }
+
+    async function poll() {
+      if (!writer || busy) return;
+      try {
+        const response = await bridgeFetch('/api/next', { cache: 'no-store' });
+        if (response.status === 204) return;
+        if (response.status === 401) throw new Error('桥接密钥无效');
+        if (!response.ok) throw new Error(await response.text());
+        const command = await response.json();
+        if (command?.id) await execute(command);
+      } catch (error) {
+        setStatus('轮询异常：' + String(error?.message || error), 'bad');
+      }
+    }
+
+    async function requestWakeLock() {
+      try {
+        if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
+      } catch {}
+    }
+
+    async function connect() {
+      try {
+        setStatus('正在请求蓝牙…', 'warn');
+        device = await navigator.bluetooth.requestDevice({
+          filters: [{ namePrefix: 'ZT758A' }],
+          optionalServices: [SERVICE]
+        });
+        device.addEventListener('gattserverdisconnected', onDisconnected);
+        server = await device.gatt.connect();
+        const service = await server.getPrimaryService(SERVICE);
+        writer = await service.getCharacteristic(WRITE);
+        $('connect').disabled = true;
+        $('stop').disabled = false;
+        $('disconnect').disabled = false;
+        await requestWakeLock();
+        await heartbeat(true, true);
+        heartbeatTimer = setInterval(() => heartbeat(true, true), 2000);
+        pollTimer = setInterval(poll, 320);
+        setStatus('已连接并授权 · 等待 MCP', 'ok');
+      } catch (error) {
+        writer = null;
+        const message = String(error?.message || error);
+        setStatus('连接失败：' + message, 'bad');
+        await heartbeat(false, false, message);
+      }
+    }
+
+    async function disconnect() {
+      try { await stopHardware(); } catch {}
+      try { device?.gatt?.disconnect(); } catch {}
+      onDisconnected();
+    }
+
+    function onDisconnected() {
+      clearInterval(pollTimer);
+      clearInterval(heartbeatTimer);
+      clearInterval(keepaliveTimer);
+      clearTimeout(autoStopTimer);
+      pollTimer = heartbeatTimer = keepaliveTimer = autoStopTimer = null;
+      writer = server = null;
+      current = null;
+      $('connect').disabled = !bridgeKey;
+      $('stop').disabled = true;
+      $('disconnect').disabled = true;
+      heartbeat(false, false);
+      setStatus('已断开 · MCP 已撤权', 'warn');
+    }
+
+    $('saveKey').onclick = () => {
+      const value = $('bridgeKey').value.trim();
+      if (!value) return;
+      bridgeKey = value;
+      localStorage.setItem(STORAGE_KEY, bridgeKey);
+      $('bridgeKey').value = '';
+      setConfigured(true);
+      setStatus('配置已保存在本机，可以连接', 'ok');
+    };
+
+    $('connect').onclick = connect;
+    $('stop').onclick = async () => {
+      await stopHardware();
+      await heartbeat(Boolean(writer), Boolean(writer));
+      setStatus('已手动停止', 'ok');
+    };
+    $('disconnect').onclick = disconnect;
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden && writer) disconnect();
+      else if (!document.hidden) requestWakeLock();
+    });
+    window.addEventListener('pagehide', () => writer ? disconnect() : heartbeat(false, false));
+
+    setConfigured(Boolean(bridgeKey));
+    if (bridgeKey) setStatus('已配置 · 尚未连接', 'warn');
+    if (!navigator.bluetooth) setStatus('当前浏览器没有 Web Bluetooth，请用 Bluefy 打开此页', 'bad');
+  </script>
+</body>
+</html>
