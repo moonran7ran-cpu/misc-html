@@ -97,7 +97,7 @@
   <main class="wrap">
     <section class="card">
       <h1>ZT758A · 手机蓝牙桥</h1>
-      <div class="sub">在 Bluefy 中打开。连接后，本页会把远端 MCP 指令写入 ZT758A 的 FFE1。连续控制由本机按步骤执行。</div>
+      <div class="sub">在 Bluefy 中打开。连接后，本页会把远端 MCP 指令写入 ZT758A 的 FFE1。连续控制由本机按时间片执行，振动、吮吸、舌舔可以同时开。</div>
       <div id="status" class="status"><span class="dot warn"></span>正在检查配置…</div>
 
       <div id="setup" class="setup" hidden>
@@ -110,7 +110,7 @@
       <button id="stop" class="stop" disabled>立即停止</button>
       <button id="disconnect" class="secondary" disabled>断开</button>
 
-      <div class="small">安全策略：单次动作最长 15 秒；Session 最长 5 分钟，且必须拆成短步骤；命令 20 秒过期；掉线、切后台或离开页面会停止并撤销控制权。iPhone 会暂停后台网页，请保持 Bluefy 在前台。</div>
+      <div class="small">安全策略：单次动作最长 15 秒；Session 每个时间片最长 15 秒、最多 60 片、总长 5 分钟。没写的通道是关闭，不是保持。命令 20 秒过期；掉线、切后台或离开页面会停止全部通道并撤销控制权。iPhone 会暂停后台网页，请保持 Bluefy 在前台。</div>
     </section>
   </main>
 
@@ -236,23 +236,38 @@
       });
     }
 
+    function channelLevel(value, max, label) {
+      if (value === undefined || value === null || value === '') return 0;
+      const level = Number(value);
+      if (!Number.isInteger(level) || level < 0 || level > max) throw new Error(label + ' 档位不合法');
+      return level;
+    }
+
     function normalizeSession(command) {
       const steps = Array.isArray(command.steps) ? command.steps : [];
       if (steps.length < 1 || steps.length > MAX_STEPS) throw new Error('Session 步骤数量不合法');
       let total = 0;
       const normalized = steps.map((step) => {
-        const action = step?.action;
-        const seconds = Number(step?.seconds);
-        if (!['vibrate', 'suction', 'licking', 'pause'].includes(action)) throw new Error('Session 动作不合法');
-        if (!Number.isInteger(seconds) || seconds < 1 || seconds > 15) throw new Error('单步必须是 1–15 秒');
-        let mode = 0;
-        if (action !== 'pause') {
-          mode = Number(step?.mode);
-          const max = action === 'vibrate' ? 9 : 8;
-          if (!Number.isInteger(mode) || mode < 1 || mode > max) throw new Error(action + ' 档位不合法');
-        }
-        total += seconds;
-        return { action, mode, seconds };
+        const duration = Number(step?.duration ?? step?.seconds);
+        if (!Number.isInteger(duration) || duration < 1 || duration > 15) throw new Error('单步必须是 1–15 秒');
+        const hasChannels = ['vibrate', 'suction', 'licking'].some((name) => step?.[name] !== undefined && step?.[name] !== null);
+        const legacy = step?.action;
+        let vibrate = 0, suction = 0, licking = 0, pause = false;
+        if (legacy === 'pause' || step?.pause === true) pause = true;
+        else if (hasChannels) {
+          vibrate = channelLevel(step.vibrate, 9, 'vibrate');
+          suction = channelLevel(step.suction, 8, 'suction');
+          licking = channelLevel(step.licking, 8, 'licking');
+        } else if (['vibrate', 'suction', 'licking'].includes(legacy)) {
+          const max = legacy === 'vibrate' ? 9 : 8;
+          const mode = channelLevel(step.mode, max, legacy);
+          if (mode < 1) throw new Error(legacy + ' 档位不合法');
+          if (legacy === 'vibrate') vibrate = mode;
+          if (legacy === 'suction') suction = mode;
+          if (legacy === 'licking') licking = mode;
+        } else throw new Error('Session 步骤不合法');
+        total += duration;
+        return { duration, vibrate: pause ? 0 : vibrate, suction: pause ? 0 : suction, licking: pause ? 0 : licking, pause };
       });
       if (total > MAX_SESSION_SECONDS) throw new Error('Session 超过 5 分钟');
       return normalized;
@@ -260,38 +275,53 @@
 
     function sessionLabel(steps, index) {
       const step = steps[index];
-      const left = steps.slice(index).reduce((sum, item) => sum + item.seconds, 0);
-      const gear = step.action === 'pause' ? '' : ' ' + step.mode + '档';
-      return 'Session ' + (index + 1) + '/' + steps.length + ' · ' + step.action + gear + ' · 剩余约 ' + left + ' 秒';
+      const left = steps.slice(index).reduce((sum, item) => sum + item.duration, 0);
+      const state = step.pause ? '三路停止等待' : '振' + step.vibrate + ' 吮' + step.suction + ' 舔' + step.licking;
+      return 'Session ' + (index + 1) + '/' + steps.length + ' · ' + state + ' · 剩余约 ' + left + ' 秒';
+    }
+
+    async function applySlice(step, token, levels) {
+      if (step.pause) {
+        await stopHardware();
+        return { vibrate: 0, suction: 0, licking: 0 };
+      }
+      const next = { ...levels };
+      for (const channel of ['vibrate', 'suction', 'licking']) {
+        if (controlToken !== token) return levels;
+        if (step[channel] === levels[channel]) continue;
+        await writeBytes(frame(channel, step[channel]));
+        next[channel] = step[channel];
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      }
+      return next;
     }
 
     async function runSession(command, token) {
       const steps = normalizeSession(command);
       session = { id: command.id, steps, index: 0, token };
       await ack(command.id, true, 'session accepted by phone bridge');
+      let levels = { vibrate: 0, suction: 0, licking: 0 };
       for (let index = 0; index < steps.length; index += 1) {
         if (controlToken !== token) return;
         const step = steps[index];
         session.index = index;
         setStatus(sessionLabel(steps, index), 'ok');
-        if (step.action === 'pause') {
-          await stopHardware();
-          if (!await sleepUntil(step.seconds * 1000, token)) return;
-          continue;
-        }
-        await stopHardware();
+        levels = await applySlice(step, token, levels);
         if (controlToken !== token) return;
-        const bytes = frame(step.action, step.mode);
-        await writeBytes(bytes);
-        current = {
-          action: step.action,
-          mode: step.mode,
-          until: new Date(Date.now() + step.seconds * 1000).toISOString()
+        current = step.pause ? null : {
+          vibrate: levels.vibrate,
+          suction: levels.suction,
+          licking: levels.licking,
+          until: new Date(Date.now() + step.duration * 1000).toISOString()
         };
+        clearInterval(keepaliveTimer);
         keepaliveTimer = setInterval(() => {
-          if (controlToken === token && writer) writeBytes(bytes).catch(() => {});
+          if (controlToken !== token || !writer) return;
+          for (const channel of ['vibrate', 'suction', 'licking']) {
+            if (levels[channel] > 0) writeBytes(frame(channel, levels[channel])).catch(() => {});
+          }
         }, 1300);
-        const finished = await sleepUntil(step.seconds * 1000, token);
+        const finished = await sleepUntil(step.duration * 1000, token);
         clearInterval(keepaliveTimer);
         keepaliveTimer = null;
         if (!finished) return;
