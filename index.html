@@ -97,7 +97,7 @@
   <main class="wrap">
     <section class="card">
       <h1>ZT758A · 手机蓝牙桥</h1>
-      <div class="sub">在 Bluefy 中打开。连接后，本页会把远端 MCP 指令写入 ZT758A 的 FFE1。</div>
+      <div class="sub">在 Bluefy 中打开。连接后，本页会把远端 MCP 指令写入 ZT758A 的 FFE1。连续控制由本机按步骤执行。</div>
       <div id="status" class="status"><span class="dot warn"></span>正在检查配置…</div>
 
       <div id="setup" class="setup" hidden>
@@ -110,7 +110,7 @@
       <button id="stop" class="stop" disabled>立即停止</button>
       <button id="disconnect" class="secondary" disabled>断开</button>
 
-      <div class="small">安全策略：单次动作最长 15 秒；命令 20 秒过期；掉线、切后台或离开页面会停止并撤销控制权。iPhone 会暂停后台网页，请保持 Bluefy 在前台。</div>
+      <div class="small">安全策略：单次动作最长 15 秒；Session 最长 5 分钟，且必须拆成短步骤；命令 20 秒过期；掉线、切后台或离开页面会停止并撤销控制权。iPhone 会暂停后台网页，请保持 Bluefy 在前台。</div>
     </section>
   </main>
 
@@ -119,6 +119,8 @@
     const STORAGE_KEY = 'zt758a_bridge_key_v1';
     const SERVICE = '0000ffe0-0000-1000-8000-00805f9b34fb';
     const WRITE = '0000ffe1-0000-1000-8000-00805f9b34fb';
+    const MAX_STEPS = 60;
+    const MAX_SESSION_SECONDS = 300;
 
     const hashParams = new URLSearchParams(location.hash.slice(1));
     const keyFromHash = hashParams.get('key') || '';
@@ -137,7 +139,10 @@
     let autoStopTimer = null;
     let current = null;
     let busy = false;
+    let polling = false;
     let wakeLock = null;
+    let controlToken = 0;
+    let session = null;
 
     const $ = (id) => document.getElementById(id);
 
@@ -160,6 +165,15 @@
       if (!writer) throw new Error('FFE1 未连接');
       if (writer.writeValueWithoutResponse) await writer.writeValueWithoutResponse(bytes);
       else await writer.writeValue(bytes);
+    }
+
+    function abortSession() {
+      controlToken += 1;
+      session = null;
+      clearInterval(keepaliveTimer);
+      clearTimeout(autoStopTimer);
+      keepaliveTimer = null;
+      autoStopTimer = null;
     }
 
     async function stopHardware() {
@@ -210,14 +224,97 @@
       } catch {}
     }
 
+    function sleepUntil(ms, token) {
+      return new Promise((resolve) => {
+        const end = Date.now() + ms;
+        const timer = setInterval(() => {
+          if (controlToken !== token || Date.now() >= end) {
+            clearInterval(timer);
+            resolve(controlToken === token);
+          }
+        }, 100);
+      });
+    }
+
+    function normalizeSession(command) {
+      const steps = Array.isArray(command.steps) ? command.steps : [];
+      if (steps.length < 1 || steps.length > MAX_STEPS) throw new Error('Session 步骤数量不合法');
+      let total = 0;
+      const normalized = steps.map((step) => {
+        const action = step?.action;
+        const seconds = Number(step?.seconds);
+        if (!['vibrate', 'suction', 'licking', 'pause'].includes(action)) throw new Error('Session 动作不合法');
+        if (!Number.isInteger(seconds) || seconds < 1 || seconds > 15) throw new Error('单步必须是 1–15 秒');
+        let mode = 0;
+        if (action !== 'pause') {
+          mode = Number(step?.mode);
+          const max = action === 'vibrate' ? 9 : 8;
+          if (!Number.isInteger(mode) || mode < 1 || mode > max) throw new Error(action + ' 档位不合法');
+        }
+        total += seconds;
+        return { action, mode, seconds };
+      });
+      if (total > MAX_SESSION_SECONDS) throw new Error('Session 超过 5 分钟');
+      return normalized;
+    }
+
+    function sessionLabel(steps, index) {
+      const step = steps[index];
+      const left = steps.slice(index).reduce((sum, item) => sum + item.seconds, 0);
+      const gear = step.action === 'pause' ? '' : ' ' + step.mode + '档';
+      return 'Session ' + (index + 1) + '/' + steps.length + ' · ' + step.action + gear + ' · 剩余约 ' + left + ' 秒';
+    }
+
+    async function runSession(command, token) {
+      const steps = normalizeSession(command);
+      session = { id: command.id, steps, index: 0, token };
+      await ack(command.id, true, 'session accepted by phone bridge');
+      for (let index = 0; index < steps.length; index += 1) {
+        if (controlToken !== token) return;
+        const step = steps[index];
+        session.index = index;
+        setStatus(sessionLabel(steps, index), 'ok');
+        if (step.action === 'pause') {
+          await stopHardware();
+          if (!await sleepUntil(step.seconds * 1000, token)) return;
+          continue;
+        }
+        await stopHardware();
+        if (controlToken !== token) return;
+        const bytes = frame(step.action, step.mode);
+        await writeBytes(bytes);
+        current = {
+          action: step.action,
+          mode: step.mode,
+          until: new Date(Date.now() + step.seconds * 1000).toISOString()
+        };
+        keepaliveTimer = setInterval(() => {
+          if (controlToken === token && writer) writeBytes(bytes).catch(() => {});
+        }, 1300);
+        const finished = await sleepUntil(step.seconds * 1000, token);
+        clearInterval(keepaliveTimer);
+        keepaliveTimer = null;
+        if (!finished) return;
+      }
+      if (controlToken === token) {
+        await stopHardware();
+        session = null;
+        setStatus('Session 完成 · 等待指令', 'ok');
+      }
+    }
+
     async function execute(command) {
+      const token = ++controlToken;
+      session = null;
       busy = true;
       try {
         if (command.action === 'stop') {
           await stopHardware();
           await ack(command.id, true, 'all functions stopped');
           setStatus('已停止 · 等待指令', 'ok');
-        } else {
+        } else if (command.action === 'session') {
+          await runSession(command, token);
+        } else if (['vibrate', 'suction', 'licking'].includes(command.action)) {
           await stopHardware();
           const bytes = frame(command.action, Number(command.mode));
           await writeBytes(bytes);
@@ -228,38 +325,48 @@
             until: new Date(Date.now() + seconds * 1000).toISOString()
           };
           keepaliveTimer = setInterval(() => {
-            if (writer && current) writeBytes(bytes).catch(() => {});
+            if (writer && current && controlToken === token) writeBytes(bytes).catch(() => {});
           }, 1300);
           autoStopTimer = setTimeout(async () => {
+            if (controlToken !== token) return;
             await stopHardware();
             await heartbeat(true, true);
             setStatus('自动停止 · 等待指令', 'ok');
           }, seconds * 1000);
           await ack(command.id, true, command.action + ' mode ' + command.mode + ' written by phone bridge');
           setStatus('执行中：' + command.action + ' ' + command.mode + '档', 'ok');
+        } else {
+          await stopHardware();
+          await ack(command.id, false, 'unsupported action');
+          setStatus('收到无法执行的指令，已停止', 'bad');
         }
       } catch (error) {
         const message = String(error?.message || error);
         await ack(command.id, false, message);
         setStatus('执行失败：' + message, 'bad');
       } finally {
-        busy = false;
+        if (controlToken === token) busy = false;
         await heartbeat(Boolean(writer), Boolean(writer));
       }
     }
 
     async function poll() {
-      if (!writer || busy) return;
+      if (!writer || polling) return;
+      if (busy && !session) return;
+      polling = true;
+      let command = null;
       try {
         const response = await bridgeFetch('/api/next', { cache: 'no-store' });
         if (response.status === 204) return;
         if (response.status === 401) throw new Error('桥接密钥无效');
         if (!response.ok) throw new Error(await response.text());
-        const command = await response.json();
-        if (command?.id) await execute(command);
+        command = await response.json();
       } catch (error) {
         setStatus('轮询异常：' + String(error?.message || error), 'bad');
+      } finally {
+        polling = false;
       }
+      if (command?.id) await execute(command);
     }
 
     async function requestWakeLock() {
@@ -296,12 +403,14 @@
     }
 
     async function disconnect() {
+      abortSession();
       try { await stopHardware(); } catch {}
       try { device?.gatt?.disconnect(); } catch {}
       onDisconnected();
     }
 
     function onDisconnected() {
+      abortSession();
       clearInterval(pollTimer);
       clearInterval(heartbeatTimer);
       clearInterval(keepaliveTimer);
@@ -309,6 +418,7 @@
       pollTimer = heartbeatTimer = keepaliveTimer = autoStopTimer = null;
       writer = server = null;
       current = null;
+      busy = false;
       $('connect').disabled = !bridgeKey;
       $('stop').disabled = true;
       $('disconnect').disabled = true;
@@ -328,7 +438,9 @@
 
     $('connect').onclick = connect;
     $('stop').onclick = async () => {
+      abortSession();
       await stopHardware();
+      busy = false;
       await heartbeat(Boolean(writer), Boolean(writer));
       setStatus('已手动停止', 'ok');
     };
@@ -338,7 +450,11 @@
       if (document.hidden && writer) disconnect();
       else if (!document.hidden) requestWakeLock();
     });
-    window.addEventListener('pagehide', () => writer ? disconnect() : heartbeat(false, false));
+    window.addEventListener('pagehide', () => {
+      abortSession();
+      if (writer) disconnect();
+      else heartbeat(false, false);
+    });
 
     setConfigured(Boolean(bridgeKey));
     if (bridgeKey) setStatus('已配置 · 尚未连接', 'warn');
